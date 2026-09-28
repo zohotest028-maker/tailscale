@@ -1,0 +1,43 @@
+name: Windows RDP Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      user_prefix:
+        description: 'Username prefix for runner host identification'
+        required: true
+        default: 'user'
+        type: string
+
+jobs:
+  provision-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Install and Connect Tailscale
+        shell: powershell
+        run: |
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale-setup.exe"
+          Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet", "/norestart" -Wait
+          $env:Path += ";C:\Program Files\Tailscale"
+          Start-Sleep -Seconds 3
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ inputs.user_prefix }}-${{ github.run_id }}" --accept-routes
+
+      - name: Enable RDP
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+
+      - name: Set RDP Credentials
+        shell: powershell
+        run: |
+          $Password = ConvertTo-SecureString "P@ssw0rd!" -AsPlainText -Force
+          $UserAccount = Get-LocalUser -Name "runneradmin"
+          $UserAccount | Set-LocalUser -Password $Password
+
+      - name: Keep Alive
+        shell: powershell
+        run: Start-Sleep -Seconds 21600
