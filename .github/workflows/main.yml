@@ -38,6 +38,38 @@ jobs:
           $UserAccount = Get-LocalUser -Name "runneradmin"
           $UserAccount | Set-LocalUser -Password $Password
 
+      - name: Install Software and Playwright
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+
+          # 1. Silently install Google Chrome
+          Invoke-WebRequest -Uri "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile "$env:TEMP\chrome_installer.exe"
+          Start-Process "$env:TEMP\chrome_installer.exe" -ArgumentList "/silent", "/install" -Wait
+
+          # 2. Silently install WinRAR (Latest x64 stable version)
+          Invoke-WebRequest -Uri "https://www.rarlab.com/rar/winrar-x64-701.exe" -OutFile "$env:TEMP\winrar_installer.exe"
+          Start-Process "$env:TEMP\winrar_installer.exe" -ArgumentList "/s" -Wait
+
+          # 3. Download and silently install Python 3.14.5 with system PATH integration
+          $PythonVersion = "3.14.5"
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe" -OutFile "$env:TEMP\python_installer.exe"
+          $PythonArgs = @(
+              '/passive',
+              'InstallAllUsers=1',
+              'PrependPath=1',
+              'Include_test=0'
+          )
+          Start-Process -FilePath "$env:TEMP\python_installer.exe" -ArgumentList $PythonArgs -Wait
+
+          # Refresh environment PATH so pip and python commands work immediately in the same session
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+          # 4. Install Playwright and its Chromium binaries
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install chromium
+
       - name: Keep Alive
         shell: powershell
         run: Start-Sleep -Seconds 21600
