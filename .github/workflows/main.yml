@@ -15,14 +15,155 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Install and Connect Tailscale
+      - name: Install Software and Playwright
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale-setup.exe"
-          Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet", "/norestart" -Wait
-          $env:Path += ";C:\Program Files\Tailscale"
-          Start-Sleep -Seconds 3
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ inputs.user_prefix }}-${{ github.run_id }}" --accept-routes
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          # 1. Silently install Google Chrome
+          Invoke-WebRequest -Uri "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile "$env:TEMP\chrome_installer.exe"
+          Start-Process "$env:TEMP\chrome_installer.exe" -ArgumentList "/silent", "/install" -Wait
+          Remove-Item "$env:TEMP\chrome_installer.exe" -Force -ErrorAction SilentlyContinue
+
+          # 2. Silently install WinRAR (x64)
+          Invoke-WebRequest -Uri "https://www.rarlab.com/rar/winrar-x64-701.exe" -OutFile "$env:TEMP\winrar_installer.exe"
+          Start-Process "$env:TEMP\winrar_installer.exe" -ArgumentList "/s" -Wait
+          Remove-Item "$env:TEMP\winrar_installer.exe" -Force -ErrorAction SilentlyContinue
+
+          # 3. Attempt Python 3.14.5 install without blocking on exit code
+          $PythonVersion = "3.14.5"
+          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe" -OutFile "$env:TEMP\python_installer.exe"
+          $PythonArgs = @(
+              '/quiet',
+              'InstallAllUsers=1',
+              'PrependPath=1',
+              'Include_test=0'
+          )
+          Start-Process -FilePath "$env:TEMP\python_installer.exe" -ArgumentList $PythonArgs -Wait
+          Remove-Item "$env:TEMP\python_installer.exe" -Force -ErrorAction SilentlyContinue
+
+          # Refresh environment PATH for current session
+          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
+
+          # 4. Install Playwright and its Chromium binaries
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install chromium
+
+      - name: Install Latest AliasMode
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          $TargetDir = "C:\Temp"
+          New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+
+          $Headers = @{
+              "User-Agent"    = "Windows-RDP-Runner"
+              "Authorization" = "Bearer ${{ secrets.GITHUB_TOKEN }}"
+          }
+          $Releases = Invoke-RestMethod -Uri "https://api.github.com/repos/aliasmode/aliasmode/releases?per_page=10" -Headers $Headers
+          $Release = $Releases |
+              Where-Object { -not $_.draft -and ($_.assets | Where-Object { $_.name -like "*_x64-offline-setup.exe" }) } |
+              Select-Object -First 1
+
+          if (-not $Release) {
+              throw "Could not locate an x64 offline setup asset in recent aliasmode/aliasmode releases."
+          }
+
+          $Asset = $Release.assets |
+              Where-Object { $_.name -like "*_x64-offline-setup.exe" } |
+              Select-Object -First 1
+
+          Add-Content -Path $env:GITHUB_ENV -Value "ALIASMODE_TAG=$($Release.tag_name)" -Encoding ascii
+
+          $InstallerPath = Join-Path $TargetDir $Asset.name
+          Write-Host "Downloading $($Asset.name) ($($Release.tag_name))..."
+          Invoke-WebRequest -Uri $Asset.browser_download_url -OutFile $InstallerPath
+
+          Write-Host "Running silent NSIS installation..."
+          $Proc = Start-Process -FilePath $InstallerPath -ArgumentList "/S" -Wait -PassThru
+          if ($Proc.ExitCode -ne 0) {
+              throw "AliasMode installer exited with code $($Proc.ExitCode)."
+          }
+          Remove-Item $InstallerPath -Force -ErrorAction SilentlyContinue
+
+          $AliasModeExe = Join-Path $env:LOCALAPPDATA "AliasMode\AliasMode.exe"
+          if (-not (Test-Path $AliasModeExe)) {
+              throw "AliasMode.exe not found at expected path: $AliasModeExe"
+          }
+          Write-Host "AliasMode installed successfully at $AliasModeExe"
+
+      - name: Pre-download AliasMode Chromium Engine
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          $Tag = if ($env:ALIASMODE_TAG) { $env:ALIASMODE_TAG } else { "main" }
+          $SpecUrl = "https://raw.githubusercontent.com/aliasmode/aliasmode/$Tag/aliasmode-chromium.ts"
+          Write-Host "Reading pinned Windows Chromium spec from $Tag..."
+          $ChromiumSrc = Invoke-RestMethod -Uri $SpecUrl
+
+          $OwnVersion = if ($ChromiumSrc -match 'const\s+OWN_VERSION\s*=\s*"([^"]+)"') { $Matches[1] } else { throw "Could not parse OWN_VERSION" }
+          $OwnRelease = if ($ChromiumSrc -match 'const\s+OWN_RELEASE\s*=\s*"([^"]+)"') { $Matches[1] } else { throw "Could not parse OWN_RELEASE" }
+          $WinBlock   = if ($ChromiumSrc -match '(?s)const\s+WINDOWS_BUILD\s*=\s*\{(.*?)\r?\n\};') { $Matches[1] } else { throw "Could not parse WINDOWS_BUILD" }
+
+          $ExecutableRel = if ($WinBlock -match 'executable:\s*"([^"]+)"') { $Matches[1] } else { throw "Could not parse executable" }
+          $ArchiveSha256 = if ($WinBlock -match 'archiveSha256:\s*"([a-fA-F0-9]{64})"') { $Matches[1].ToLowerInvariant() } else { throw "Could not parse archiveSha256" }
+          $ExeSha256     = if ($WinBlock -match 'executableSha256:\s*"([a-fA-F0-9]{64})"') { $Matches[1].ToLowerInvariant() } else { throw "Could not parse executableSha256" }
+
+          $ArchiveRoot    = "aliasmode-chromium-$OwnVersion-windows-x64"
+          $RuntimeDirName = "chromium-$OwnVersion-$OwnRelease"
+          $DownloadUrl    = "https://github.com/aliasmode/aliasmode-chromium/releases/download/v$OwnVersion-$OwnRelease/$ArchiveRoot.zip"
+
+          $RuntimeRoot = Join-Path $env:APPDATA "com.aliasmode.desktop\runtimes"
+          $TargetDir   = Join-Path $RuntimeRoot $RuntimeDirName
+          $ExePath     = Join-Path $TargetDir $ExecutableRel
+
+          New-Item -ItemType Directory -Path $RuntimeRoot -Force | Out-Null
+          $TempDir    = Join-Path "C:\Temp" ("am-chromium-" + [guid]::NewGuid().ToString("N").Substring(0, 8))
+          $ExtractDir = Join-Path $TempDir "extracted"
+          $ZipPath    = Join-Path $TempDir "$ArchiveRoot.zip"
+          New-Item -ItemType Directory -Path $ExtractDir -Force | Out-Null
+
+          try {
+              Write-Host "Downloading $ArchiveRoot.zip..."
+              & "$env:SystemRoot\System32\curl.exe" -fsSL --retry 3 -o $ZipPath $DownloadUrl
+              if ($LASTEXITCODE -ne 0) { throw "curl.exe failed with exit code $LASTEXITCODE" }
+
+              $ActualArchiveHash = (Get-FileHash -Path $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($ActualArchiveHash -ne $ArchiveSha256) {
+                  throw "Archive SHA-256 mismatch (expected $ArchiveSha256, got $ActualArchiveHash)"
+              }
+
+              Write-Host "Extracting runtime..."
+              & "$env:SystemRoot\System32\tar.exe" -xf $ZipPath -C $ExtractDir
+              if ($LASTEXITCODE -ne 0) { throw "tar.exe failed with exit code $LASTEXITCODE" }
+
+              $SourceRuntimeDir = Join-Path $ExtractDir $ArchiveRoot
+              if (-not (Test-Path $SourceRuntimeDir)) {
+                  throw "Expected extracted folder not found: $SourceRuntimeDir"
+              }
+
+              if (Test-Path $TargetDir) {
+                  Remove-Item -Path $TargetDir -Recurse -Force
+              }
+              Move-Item -Path $SourceRuntimeDir -Destination $TargetDir
+
+              $ActualExeHash = (Get-FileHash -Path $ExePath -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($ActualExeHash -ne $ExeSha256) {
+                  throw "Executable SHA-256 mismatch (expected $ExeSha256, got $ActualExeHash)"
+              }
+
+              & "$env:SystemRoot\System32\icacls.exe" $TargetDir /grant '*S-1-15-2-1:(OI)(CI)(RX)' '*S-1-15-2-2:(OI)(CI)(RX)' /T /Q
+              Write-Host "AliasMode Chromium $OwnVersion ($OwnRelease) verified and ready at $TargetDir"
+          } finally {
+              Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Enable RDP
         shell: powershell
@@ -38,37 +179,16 @@ jobs:
           $UserAccount = Get-LocalUser -Name "runneradmin"
           $UserAccount | Set-LocalUser -Password $Password
 
-      - name: Install Software and Playwright
+      - name: Install and Connect Tailscale
         shell: powershell
         run: |
           $ProgressPreference = 'SilentlyContinue'
-
-          # 1. Silently install Google Chrome
-          Invoke-WebRequest -Uri "https://dl.google.com/chrome/install/latest/chrome_installer.exe" -OutFile "$env:TEMP\chrome_installer.exe"
-          Start-Process "$env:TEMP\chrome_installer.exe" -ArgumentList "/silent", "/install" -Wait
-
-          # 2. Silently install WinRAR (Latest x64 stable version)
-          Invoke-WebRequest -Uri "https://www.rarlab.com/rar/winrar-x64-701.exe" -OutFile "$env:TEMP\winrar_installer.exe"
-          Start-Process "$env:TEMP\winrar_installer.exe" -ArgumentList "/s" -Wait
-
-          # 3. Download and silently install Python 3.14.5 with system PATH integration
-          $PythonVersion = "3.14.5"
-          Invoke-WebRequest -Uri "https://www.python.org/ftp/python/$PythonVersion/python-$PythonVersion-amd64.exe" -OutFile "$env:TEMP\python_installer.exe"
-          $PythonArgs = @(
-              '/passive',
-              'InstallAllUsers=1',
-              'PrependPath=1',
-              'Include_test=0'
-          )
-          Start-Process -FilePath "$env:TEMP\python_installer.exe" -ArgumentList $PythonArgs -Wait
-
-          # Refresh environment PATH so pip and python commands work immediately in the same session
-          $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path", "User")
-
-          # 4. Install Playwright and its Chromium binaries
-          python -m pip install --upgrade pip
-          python -m pip install playwright
-          python -m playwright install chromium
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile "$env:TEMP\tailscale-setup.exe"
+          Start-Process "$env:TEMP\tailscale-setup.exe" -ArgumentList "/quiet", "/norestart" -Wait
+          Remove-Item "$env:TEMP\tailscale-setup.exe" -Force -ErrorAction SilentlyContinue
+          $env:Path += ";C:\Program Files\Tailscale"
+          Start-Sleep -Seconds 3
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey="${{ secrets.TAILSCALE_AUTH_KEY }}" --hostname="${{ inputs.user_prefix }}-${{ github.run_id }}" --accept-routes
 
       - name: Keep Alive
         shell: powershell
