@@ -165,6 +165,60 @@ jobs:
               Remove-Item -Path $TempDir -Recurse -Force -ErrorAction SilentlyContinue
           }
 
+      - name: Install Mysterium VPN and Create Desktop Shortcut
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          $TargetDir = "C:\Temp"
+          New-Item -ItemType Directory -Path $TargetDir -Force | Out-Null
+
+          $MsixUrl  = "https://github.com/mysteriumnetwork/mysterium-vpn-release/releases/latest/download/MysteriumVPN.msix"
+          $MsixPath = Join-Path $TargetDir "MysteriumVPN.msix"
+
+          Write-Host "Downloading MysteriumVPN.msix..."
+          & "$env:SystemRoot\System32\curl.exe" -fsSL --retry 3 -o $MsixPath $MsixUrl
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path $MsixPath)) {
+              throw "Failed to download MysteriumVPN.msix (curl exit code: $LASTEXITCODE)."
+          }
+
+          try {
+              Write-Host "Installing Mysterium VPN MSIX package..."
+              Add-AppxPackage -Path $MsixPath -ErrorAction Stop
+          } finally {
+              Remove-Item -Path $MsixPath -Force -ErrorAction SilentlyContinue
+          }
+
+          $Installed = Get-AppxPackage | Where-Object { $_.Name -like "*Mysterium*" } | Select-Object -First 1
+          if (-not $Installed) {
+              throw "Mysterium VPN package not found after installation."
+          }
+
+          $Manifest = Get-AppxPackageManifest -Package $Installed.PackageFullName
+          $AppEntry = @($Manifest.Package.Applications.Application)[0]
+          $AppId    = if ($AppEntry.Id) { $AppEntry.Id } else { "App" }
+          $Aumid    = "$($Installed.PackageFamilyName)!$AppId"
+
+          $DesktopDir   = Join-Path $env:USERPROFILE "Desktop"
+          New-Item -ItemType Directory -Path $DesktopDir -Force | Out-Null
+          $ShortcutPath = Join-Path $DesktopDir "Mysterium VPN.lnk"
+
+          $WshShell = New-Object -ComObject WScript.Shell
+          $Shortcut = $WshShell.CreateShortcut($ShortcutPath)
+          $Shortcut.TargetPath  = "$env:SystemRoot\explorer.exe"
+          $Shortcut.Arguments   = "shell:AppsFolder\$Aumid"
+          $Shortcut.Description = "Launch Mysterium VPN"
+
+          $IconCandidate = Get-ChildItem -Path $Installed.InstallLocation -Recurse -Include *.ico, *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($IconCandidate) {
+              $Shortcut.IconLocation = "$($IconCandidate.FullName),0"
+          }
+
+          $Shortcut.Save()
+          Write-Host "Mysterium VPN $($Installed.Version) installed and shortcut created at $ShortcutPath"
+
       - name: Enable RDP
         shell: powershell
         run: |
